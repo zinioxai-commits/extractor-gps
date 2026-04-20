@@ -43,15 +43,20 @@ def llamar_gpt(img_pil, api_key, modelo="gpt-4o-mini", detalle="low", zoom=False
                 {
                     "type": "text",
                     "text": (
-                        "Busca el texto azul en la esquina inferior derecha de esta imagen. "
-                        "Contiene fecha, hora y coordenadas GPS en formato:\n"
+                        "En esta foto hay un dispositivo GPS Garmin. "
+                        "IGNORA completamente la pantalla del GPS y los números que aparecen en ella "
+                        "(como UTM, Ubicación, Altura, etc.).\n\n"
+                        "Busca ÚNICAMENTE el texto azul impreso en la esquina inferior derecha "
+                        "de la FOTOGRAFÍA (fuera del dispositivo), que tiene este formato exacto:\n"
                         "  DD mes AAAA  H:MM:SS a.m./p.m.\n"
-                        "  XX.XXXXXXS YY.YYYYYYYW\n\n"
-                        "Extrae los valores EXACTOS como aparecen.\n"
-                        "Responde ÚNICAMENTE con JSON válido (sin markdown):\n"
+                        "  XX.XXXXXXS  YY.YYYYYYYW\n\n"
+                        "Ejemplo de texto azul correcto:\n"
+                        "  7 abr 2026  1:10:17 p.m.\n"
+                        "  14.062602S  69.203552W\n\n"
+                        "Extrae esos valores EXACTOS y responde SOLO con JSON válido (sin markdown):\n"
                         '{"fecha":"7 abr 2026","hora":"1:10:17 p.m.",'
                         '"latitud":"14.062602S","longitud":"69.203552W"}\n'
-                        "Si no encuentras algún valor usa null."
+                        "Si no encuentras el texto azul exterior usa null."
                     )
                 }
             ]
@@ -144,12 +149,14 @@ def generar_excel(datos):
     ws.row_dimensions[1].height = 22
 
     for i, (arch, fecha, hora, lat, lon, est) in enumerate(datos, 1):
-        for col, val in enumerate([i, arch, fecha, hora, lat, lon, est], 1):
+        # Convertir lat/lon a texto con punto decimal para evitar problema regional
+        lat_str = f"{lat:.6f}".replace(',', '.') if lat is not None else ""
+        lon_str = f"{lon:.6f}".replace(',', '.') if lon is not None else ""
+        fila_vals = [i, arch, fecha, hora, lat_str, lon_str, est]
+        for col, val in enumerate(fila_vals, 1):
             c = ws.cell(row=i+1, column=col, value=val)
             c.font=fn; c.alignment=ci if col==2 else cc; c.border=bd
             if i%2==0: c.fill=fb
-        ws.cell(row=i+1, column=5).number_format = '0.000000'
-        ws.cell(row=i+1, column=6).number_format = '0.000000'
 
     for col, ancho in zip('ABCDEFG', [5,38,18,16,14,14,16]):
         ws.column_dimensions[col].width = ancho

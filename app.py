@@ -16,15 +16,15 @@ def imagen_a_base64(img_pil, quality=90):
     img_pil.save(buf, format="JPEG", quality=quality)
     return base64.b64encode(buf.getvalue()).decode()
 
-def recortar_zona_coordenadas(img_pil):
-    """Recorta solo el 15% inferior derecho donde está la marca de agua."""
+def recortar_marca_agua(img_pil):
+    """Recorta SOLO la esquina inferior derecha donde está la marca de agua azul.
+    Elimina completamente la pantalla del GPS del contexto visual."""
     w, h = img_pil.size
-    return img_pil.crop((w // 2, int(h * 0.82), w, h))
+    return img_pil.crop((int(w * 0.35), int(h * 0.86), w, h))
 
-def llamar_gpt(img_pil, api_key, modelo="gpt-4o-mini", detalle="low", zoom=False):
-    """Llama a la API de OpenAI con la imagen dada."""
-    if zoom:
-        img_pil = recortar_zona_coordenadas(img_pil)
+def llamar_gpt(img_pil, api_key, modelo="gpt-4o-mini", detalle="high"):
+    """Siempre recorta la zona de marca de agua antes de enviar a GPT."""
+    img_recortada = recortar_marca_agua(img_pil)
 
     payload = {
         "model": modelo,
@@ -36,27 +36,24 @@ def llamar_gpt(img_pil, api_key, modelo="gpt-4o-mini", detalle="low", zoom=False
                 {
                     "type": "image_url",
                     "image_url": {
-                        "url": f"data:image/jpeg;base64,{imagen_a_base64(img_pil)}",
+                        "url": f"data:image/jpeg;base64,{imagen_a_base64(img_recortada)}",
                         "detail": detalle
                     }
                 },
                 {
                     "type": "text",
                     "text": (
-                        "En esta foto hay un dispositivo GPS Garmin. "
-                        "IGNORA completamente la pantalla del GPS y los números que aparecen en ella "
-                        "(como UTM, Ubicación, Altura, etc.).\n\n"
-                        "Busca ÚNICAMENTE el texto azul impreso en la esquina inferior derecha "
-                        "de la FOTOGRAFÍA (fuera del dispositivo), que tiene este formato exacto:\n"
+                        "Esta imagen muestra solo la marca de agua azul de una foto GPS Garmin.\n"
+                        "Contiene dos líneas de texto azul con este formato:\n"
                         "  DD mes AAAA  H:MM:SS a.m./p.m.\n"
                         "  XX.XXXXXXS  YY.YYYYYYYW\n\n"
-                        "Ejemplo de texto azul correcto:\n"
-                        "  7 abr 2026  1:10:17 p.m.\n"
-                        "  14.062602S  69.203552W\n\n"
-                        "Extrae esos valores EXACTOS y responde SOLO con JSON válido (sin markdown):\n"
-                        '{"fecha":"7 abr 2026","hora":"1:10:17 p.m.",'
-                        '"latitud":"14.062602S","longitud":"69.203552W"}\n'
-                        "Si no encuentras el texto azul exterior usa null."
+                        "Ejemplo:\n"
+                        "  8 abr 2026  10:26:27 a.m.\n"
+                        "  14.005450S  69.252968W\n\n"
+                        "Lee el texto EXACTAMENTE como aparece y responde SOLO con JSON (sin markdown):\n"
+                        '{"fecha":"8 abr 2026","hora":"10:26:27 a.m.",'
+                        '"latitud":"14.005450S","longitud":"69.252968W"}\n'
+                        "Si no puedes leer algún valor usa null."
                     )
                 }
             ]
@@ -97,35 +94,23 @@ def parsear_lon(s):
 
 def extraer_coordenadas(img_pil, api_key):
     """
-    Intenta extraer coordenadas con hasta 3 estrategias:
-    1. Imagen completa, detalle low
-    2. Zoom en zona inferior derecha, detalle high
-    3. gpt-4o (más potente) si sigue fallando lat
+    Intento 1: gpt-4o-mini con recorte de marca de agua
+    Intento 2: gpt-4o si no detecta lat (casos difíciles)
     """
-    # Intento 1: imagen completa
-    data = llamar_gpt(img_pil, api_key, detalle="low")
-    lat = parsear_lat(data.get("latitud") if data else None)
-    lon = parsear_lon(data.get("longitud") if data else None)
+    data = llamar_gpt(img_pil, api_key, modelo="gpt-4o-mini")
+    lat   = parsear_lat(data.get("latitud") if data else None)
+    lon   = parsear_lon(data.get("longitud") if data else None)
     fecha = data.get("fecha") if data else None
     hora  = data.get("hora")  if data else None
 
-    # Intento 2: si falta lat → zoom en zona de coordenadas
-    if lat is None:
-        data2 = llamar_gpt(img_pil, api_key, detalle="high", zoom=True)
+    # Reintento con gpt-4o si falta lat o lon
+    if lat is None or lon is None:
+        data2 = llamar_gpt(img_pil, api_key, modelo="gpt-4o")
         if data2:
-            lat   = parsear_lat(data2.get("latitud")) or lat
+            lat   = parsear_lat(data2.get("latitud"))  or lat
             lon   = parsear_lon(data2.get("longitud")) or lon
             fecha = data2.get("fecha") or fecha
             hora  = data2.get("hora")  or hora
-
-    # Intento 3: si sigue sin lat → gpt-4o completo
-    if lat is None:
-        data3 = llamar_gpt(img_pil, api_key, modelo="gpt-4o", detalle="high", zoom=True)
-        if data3:
-            lat   = parsear_lat(data3.get("latitud")) or lat
-            lon   = parsear_lon(data3.get("longitud")) or lon
-            fecha = data3.get("fecha") or fecha
-            hora  = data3.get("hora")  or hora
 
     return lat, lon, fecha, hora
 

@@ -1,145 +1,115 @@
 import streamlit as st
-import pytesseract
 import numpy as np
 import re
 import io
-import os
+import base64
+import json
+import requests
 from PIL import Image
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-from collections import Counter
 
-if os.name == 'nt':
-    pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+# ── GPT-4o-mini Vision ────────────────────────────────────────────────────────
 
-# ── Extracción ────────────────────────────────────────────────────────────────
+def imagen_a_base64(img_pil):
+    buf = io.BytesIO()
+    img_pil.save(buf, format="JPEG", quality=85)
+    return base64.b64encode(buf.getvalue()).decode()
 
-def aislar_texto_azul(img_pil, franja):
-    w, h = img_pil.size
-    crop = img_pil.crop((0, int(h * (1 - franja)), w, h))
-    arr = np.array(crop)
-    mask = (arr[:,:,2] > 80) & (arr[:,:,0] < 150) & (arr[:,:,1] < 200) & (arr[:,:,2] > arr[:,:,0])
-    res = np.ones_like(arr) * 255
-    res[mask] = [0, 0, 0]
-    img2 = Image.fromarray(res.astype(np.uint8))
-    return img2.resize((img2.width * 4, img2.height * 4), Image.LANCZOS)
+def extraer_con_gpt(img_pil, api_key):
+    payload = {
+        "model": "gpt-4o-mini",
+        "max_tokens": 150,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:image/jpeg;base64,{imagen_a_base64(img_pil)}",
+                        "detail": "low"
+                    }
+                },
+                {
+                    "type": "text",
+                    "text": (
+                        "Esta imagen tiene texto azul en la esquina inferior derecha con "
+                        "fecha, hora y coordenadas GPS.\n"
+                        "Extrae EXACTAMENTE ese texto azul.\n"
+                        "Responde SOLO con JSON, sin markdown ni explicaciones:\n"
+                        '{"fecha":"7 abr 2026","hora":"1:10:17 p.m.",'
+                        '"latitud":"14.062602S","longitud":"69.203552W"}\n'
+                        "Si no hay texto azul: "
+                        '{"fecha":null,"hora":null,"latitud":null,"longitud":null}'
+                    )
+                }
+            ]
+        }]
+    }
 
-def extraer_lon(texto):
-    tu = texto.upper()
-    # Con punto decimal
-    m = re.search(r'(\d{2,3})[:\.](\d{6})\s*([WEO])', tu)
-    if m:
-        v = float(f"{m.group(1)}.{m.group(2)}")
-        return -v if m.group(3) in ('W', 'O') else v
-    # Sin punto (8 dígitos + W)
-    m = re.search(r'(\d{2})(\d{6})\s*([WEO])', tu)
-    if m:
-        v = float(f"{m.group(1)}.{m.group(2)}")
-        return -v if m.group(3) in ('W', 'O') else v
-    return None
+    try:
+        resp = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={"Content-Type": "application/json",
+                     "Authorization": f"Bearer {api_key}"},
+            json=payload, timeout=30
+        )
+        if resp.status_code != 200:
+            return None, None, None, None, f"Error {resp.status_code}"
 
-def extraer_lat(texto):
-    tu = texto.upper()
-    # Caso 1: normal con separador  →  14.060653S
-    m = re.search(r'(\d{2})[^0-9A-Z]{0,2}(\d{6})\s*([NS])', tu)
-    if m:
-        v = float(f"{m.group(1)}.{m.group(2)}")
-        return -v if m.group(3) == 'S' else v
-    # Caso 2: sin separador  →  14060653S
-    m = re.search(r'(\d{2})(\d{6})\s*([NS])', tu)
-    if m:
-        v = float(f"{m.group(1)}.{m.group(2)}")
-        return -v if m.group(3) == 'S' else v
-    # Caso 3: dígitos + S + espacio + lon (identifica S-hemisferio real)
-    m = re.search(r'(\d+)\s*([NS])\s+\d', tu)
-    if m:
-        bloque, hem = m.group(1), m.group(2)
-        if len(bloque) >= 6:
-            dec = bloque[-6:]
-            entero = bloque[-8:-6] if len(bloque) >= 8 else "14"
-            if not entero or not entero.isdigit() or int(entero) == 0:
-                entero = "14"
-            v = float(f"{entero}.{dec}")
-            if 0 < v < 25:
-                return -v if hem == 'S' else v
-    # Caso 4: lat fusionada con lon  →  14:0626028369:203552W
-    m = re.search(r'(\d{1,3})[:\.](\d{6}).{0,4}?(\d{2})[:\.](\d{6})\s*([WEO])', tu)
-    if m:
-        return -float(f"{m.group(1)}.{m.group(2)}")
-    return None
+        texto = resp.json()["choices"][0]["message"]["content"].strip()
+        texto = re.sub(r"```json|```", "", texto).strip()
+        data  = json.loads(texto)
 
-def votar(valores):
-    vals = [round(v, 4) for v in valores if v is not None]
-    if not vals:
-        return None
-    ganador = Counter(vals).most_common(1)[0][0]
-    # Devolver el valor original más cercano al ganador (con más precisión)
-    originales = [v for v in valores if v is not None and abs(round(v,4) - ganador) < 0.0001]
-    return originales[0] if originales else ganador
+        lat, lon = None, None
+        m = re.search(r'([\d.]+)\s*([NS])', (data.get("latitud") or "").upper())
+        if m:
+            lat = float(m.group(1))
+            if m.group(2) == 'S': lat = -lat
 
-def parsear_fecha_hora(texto):
-    m = re.search(
-        r'(\d{1,2}[\s\-]\w{2,4}[\s\-:]\d{4})\s+(\d{1,2}:\d{2}:\d{2}\s*[ap]\.?m\.?)',
-        texto, re.IGNORECASE
-    )
-    if m:
-        fecha = re.sub(r'[\-:]', ' ', m.group(1)).strip()
-        return fecha, m.group(2).strip()
-    return None, None
+        m = re.search(r'([\d.]+)\s*([WEO])', (data.get("longitud") or "").upper())
+        if m:
+            lon = float(m.group(1))
+            if m.group(2) in ('W','O'): lon = -lon
 
-def procesar_imagen(img_pil):
-    """Prueba múltiples franjas y vota por la coordenada más frecuente."""
-    lats, lons, fechas, horas = [], [], [], []
-    for franja in [0.05, 0.06, 0.07, 0.08, 0.09, 0.10, 0.12]:
-        proc = aislar_texto_azul(img_pil, franja)
-        texto = pytesseract.image_to_string(proc, lang='eng', config='--psm 6 --oem 3')
-        for linea in texto.split('\n'):
-            lats.append(extraer_lat(linea))
-            lons.append(extraer_lon(linea))
-        f, h = parsear_fecha_hora(texto)
-        if f: fechas.append(f)
-        if h: horas.append(h)
-    lat = votar(lats)
-    lon = votar(lons)
-    fecha = Counter(fechas).most_common(1)[0][0] if fechas else None
-    hora  = Counter(horas).most_common(1)[0][0]  if horas  else None
-    return lat, lon, fecha, hora
+        return lat, lon, data.get("fecha"), data.get("hora"), None
+
+    except Exception as e:
+        return None, None, None, None, str(e)
+
+
+# ── Excel ─────────────────────────────────────────────────────────────────────
 
 def generar_excel(datos):
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Coordenadas GPS"
-    f_titulo = Font(name='Arial', bold=True, color='FFFFFF', size=11)
-    f_normal = Font(name='Arial', size=10)
-    fill_azul = PatternFill('solid', start_color='2E75B6')
-    fill_alt  = PatternFill('solid', start_color='DDEEFF')
-    centro = Alignment(horizontal='center', vertical='center')
-    izq    = Alignment(horizontal='left',   vertical='center')
-    borde  = Border(left=Side(style='thin'), right=Side(style='thin'),
-                    top=Side(style='thin'),  bottom=Side(style='thin'))
-    encabezados = ['#', 'Archivo', 'Fecha', 'Hora', 'Latitud', 'Longitud', 'Estado']
-    for col, enc in enumerate(encabezados, 1):
+    wb = Workbook(); ws = wb.active; ws.title = "Coordenadas GPS"
+    ft = Font(name='Arial', bold=True, color='FFFFFF', size=11)
+    fn = Font(name='Arial', size=10)
+    fa = PatternFill('solid', start_color='2E75B6')
+    fb = PatternFill('solid', start_color='DDEEFF')
+    cc = Alignment(horizontal='center', vertical='center')
+    ci = Alignment(horizontal='left',   vertical='center')
+    bd = Border(left=Side(style='thin'), right=Side(style='thin'),
+                top=Side(style='thin'),  bottom=Side(style='thin'))
+
+    for col, enc in enumerate(['#','Archivo','Fecha','Hora','Latitud','Longitud','Estado'], 1):
         c = ws.cell(row=1, column=col, value=enc)
-        c.font = f_titulo; c.fill = fill_azul
-        c.alignment = centro; c.border = borde
+        c.font=ft; c.fill=fa; c.alignment=cc; c.border=bd
     ws.row_dimensions[1].height = 22
-    for i, (archivo, fecha, hora, lat, lon, estado) in enumerate(datos, 1):
-        fila = i + 1
-        for col, val in enumerate([i, archivo, fecha, hora, lat, lon, estado], 1):
-            c = ws.cell(row=fila, column=col, value=val)
-            c.font = f_normal
-            c.alignment = izq if col == 2 else centro
-            c.border = borde
-            if i % 2 == 0: c.fill = fill_alt
-        ws.cell(row=fila, column=5).number_format = '0.000000'
-        ws.cell(row=fila, column=6).number_format = '0.000000'
-    for col, ancho in zip('ABCDEFG', [5, 38, 18, 16, 14, 14, 16]):
+
+    for i, (arch, fecha, hora, lat, lon, est) in enumerate(datos, 1):
+        for col, val in enumerate([i, arch, fecha, hora, lat, lon, est], 1):
+            c = ws.cell(row=i+1, column=col, value=val)
+            c.font=fn; c.alignment=ci if col==2 else cc; c.border=bd
+            if i%2==0: c.fill=fb
+        ws.cell(row=i+1, column=5).number_format = '0.000000'
+        ws.cell(row=i+1, column=6).number_format = '0.000000'
+
+    for col, ancho in zip('ABCDEFG', [5,38,18,16,14,14,16]):
         ws.column_dimensions[col].width = ancho
     ws.freeze_panes = 'A2'
-    buf = io.BytesIO()
-    wb.save(buf)
-    buf.seek(0)
+    buf = io.BytesIO(); wb.save(buf); buf.seek(0)
     return buf
+
 
 # ── UI ────────────────────────────────────────────────────────────────────────
 
@@ -147,54 +117,88 @@ st.set_page_config(page_title="Extractor GPS Garmin", page_icon="📍", layout="
 
 st.markdown("""
 <style>
-.main-title { font-size:2.2rem; font-weight:700; color:#1a3a5c; }
-.subtitle   { color:#666; font-size:1rem; margin-bottom:1.5rem; }
-</style>
-""", unsafe_allow_html=True)
+.main-title{font-size:2.2rem;font-weight:700;color:#1a3a5c;}
+.subtitle{color:#666;font-size:1rem;margin-bottom:1rem;}
+.costo{background:#f0fff4;border:1px solid #68d391;border-radius:8px;
+       padding:0.5rem 1rem;font-size:0.9rem;color:#276749;margin-bottom:1rem;}
+</style>""", unsafe_allow_html=True)
 
 st.markdown('<p class="main-title">📍 Extractor de Coordenadas GPS</p>', unsafe_allow_html=True)
-st.markdown('<p class="subtitle">Sube tus fotos con marca de agua Garmin · Obtén las coordenadas en Excel al instante</p>', unsafe_allow_html=True)
-st.divider()
+st.markdown('<p class="subtitle">Sube tus fotos con marca de agua Garmin · Obtén las coordenadas en Excel</p>', unsafe_allow_html=True)
 
+# ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
+    st.markdown("### 🔑 API Key de OpenAI")
+    api_key = st.text_input(
+        "Pega tu API Key aquí",
+        type="password",
+        placeholder="sk-...",
+        help="Obtén tu key en: platform.openai.com/api-keys"
+    )
+    if api_key:
+        st.success("✅ API Key ingresada")
+    else:
+        st.warning("⚠️ Ingresa tu API Key para continuar")
+        st.markdown("[Obtener API Key →](https://platform.openai.com/api-keys)")
+
+    st.divider()
+    st.markdown("### 💰 Costo estimado")
+    st.markdown("""
+    | Fotos | Costo aprox. |
+    |-------|-------------|
+    | 10    | ~$0.01      |
+    | 50    | ~$0.05      |
+    | 100   | ~$0.10      |
+    | 500   | ~$0.50      |
+
+    Modelo: **gpt-4o-mini**
+    """)
+    st.divider()
     st.markdown("### ℹ️ Cómo usar")
-    st.markdown("1. 📤 Sube una o varias fotos\n2. 🔍 Clic en **Extraer**\n3. 📊 Revisa la tabla\n4. 📥 Descarga el **Excel**")
+    st.markdown("1. 🔑 Ingresa tu API Key\n2. 📤 Sube las fotos\n3. 🔍 Clic en **Extraer**\n4. 📥 Descarga el **Excel**")
     st.divider()
     st.markdown("### 📋 Formato soportado")
     st.code("14.062602S 69.203552W")
-    st.caption("Garmin GPSmap y similares")
-    st.divider()
-    st.caption("v1.2 · Extractor GPS Garmin")
+    st.caption("Garmin GPSmap y similares · v2.0")
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+if not api_key:
+    st.info("👈 Ingresa tu API Key de OpenAI en el panel izquierdo para comenzar.")
+    st.stop()
 
 archivos = st.file_uploader(
-    "📤 Arrastra tus fotos aquí o haz clic para seleccionar",
-    type=["jpg", "jpeg", "png"],
+    "📤 Arrastra tus fotos o haz clic para seleccionar",
+    type=["jpg","jpeg","png"],
     accept_multiple_files=True
 )
 
 if not archivos:
-    st.info("👆 Sube tus fotos para comenzar.")
+    st.info("👆 Sube tus fotos para comenzar. Puedes seleccionar varias a la vez.")
     st.stop()
 
-st.divider()
+# Estimado de costo
+costo_est = len(archivos) * 0.001
+st.markdown(f'<div class="costo">💰 Costo estimado para {len(archivos)} foto(s): <b>~${costo_est:.3f} USD</b></div>',
+            unsafe_allow_html=True)
 
+# Vista previa
 with st.expander(f"🖼️ Vista previa — {len(archivos)} foto(s)", expanded=False):
     cols = st.columns(min(len(archivos), 4))
     for i, f in enumerate(archivos):
-        with cols[i % 4]:
+        with cols[i%4]:
             f.seek(0)
             st.image(Image.open(f), caption=f.name, use_container_width=True)
 
 st.divider()
 
 if st.button("🔍 Extraer coordenadas", type="primary", use_container_width=True):
-    datos = []
-    ok_count = 0
+    datos=[]; ok_count=0
     progress = st.progress(0, text="Iniciando...")
     status   = st.empty()
 
-    encabezados_cols = st.columns([0.4, 2.2, 1.4, 1.4, 1.4, 1.4, 0.5])
-    for col, lbl in zip(encabezados_cols, ['#', 'Archivo', 'Fecha', 'Hora', 'Latitud', 'Longitud', '✓']):
+    # Encabezados tabla
+    hcols = st.columns([0.4, 2.2, 1.4, 1.4, 1.4, 1.4, 0.5])
+    for col, lbl in zip(hcols, ['#','Archivo','Fecha','Hora','Latitud','Longitud','✓']):
         col.markdown(f"**{lbl}**")
     st.markdown("---")
 
@@ -202,38 +206,44 @@ if st.button("🔍 Extraer coordenadas", type="primary", use_container_width=Tru
         status.info(f"⏳ Procesando **{archivo.name}** ({idx+1}/{len(archivos)})")
         try:
             archivo.seek(0)
-            img = Image.open(archivo)
-            lat, lon, fecha, hora = procesar_imagen(img)
-            if lat is not None and lon is not None:
-                ok_count += 1
-                icono = "✅"
-            else:
-                icono = "⚠️"
+            img = Image.open(archivo).convert("RGB")
+            lat, lon, fecha, hora, err = extraer_con_gpt(img, api_key)
+
+            icono = "✅" if (lat and lon) else "⚠️"
+            if lat and lon: ok_count += 1
+
             row = st.columns([0.4, 2.2, 1.4, 1.4, 1.4, 1.4, 0.5])
-            row[0].write(idx + 1)
+            row[0].write(idx+1)
             row[1].write(archivo.name)
             row[2].write(fecha or "—")
             row[3].write(hora  or "—")
             row[4].write(f"{lat:.6f}" if lat is not None else "—")
             row[5].write(f"{lon:.6f}" if lon is not None else "—")
             row[6].write(icono)
+
+            if err:
+                st.caption(f"⚠️ {archivo.name}: {err}")
+
             datos.append((archivo.name, fecha, hora, lat, lon,
-                          "OK" if lat is not None else "Sin coordenadas"))
+                          "OK" if lat and lon else (err or "Sin coordenadas")))
+
         except Exception as e:
             row = st.columns([0.4, 2.2, 1.4, 1.4, 1.4, 1.4, 0.5])
-            row[0].write(idx + 1); row[1].write(archivo.name); row[6].write("❌")
-            datos.append((archivo.name, None, None, None, None, f"Error: {e}"))
+            row[0].write(idx+1); row[1].write(archivo.name); row[6].write("❌")
+            datos.append((archivo.name, None, None, None, None, str(e)))
 
-        progress.progress((idx + 1) / len(archivos), text=f"Procesando {idx+1}/{len(archivos)}...")
+        progress.progress((idx+1)/len(archivos), text=f"Procesando {idx+1}/{len(archivos)}...")
 
     status.empty(); progress.empty()
     st.divider()
 
+    costo_real = ok_count * 0.001
     if ok_count > 0:
         fail = len(archivos) - ok_count
-        st.success(f"✅ {ok_count} foto(s) procesadas · {fail} sin detectar")
+        st.success(f"✅ {ok_count} foto(s) procesadas correctamente · {fail} sin detectar")
+        st.caption(f"💰 Costo aproximado: ~${costo_real:.3f} USD")
         st.download_button(
-            label="📥 Descargar Excel",
+            label="📥 Descargar Excel con coordenadas",
             data=generar_excel(datos),
             file_name="coordenadas_gps.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -241,4 +251,4 @@ if st.button("🔍 Extraer coordenadas", type="primary", use_container_width=Tru
             use_container_width=True
         )
     else:
-        st.error("❌ No se detectaron coordenadas. Verifica que las fotos tengan marca de agua azul.")
+        st.error("❌ No se detectaron coordenadas. Verifica tu API Key y las fotos.")

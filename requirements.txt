@@ -1,5 +1,4 @@
 streamlit
-pytesseract
 pillow
 openpyxl
-numpy
+requests

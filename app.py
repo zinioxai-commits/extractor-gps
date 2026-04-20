@@ -8,11 +8,10 @@ from PIL import Image
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 
-# ── Tesseract path para Windows ──────────────────────────────────────────────
 if os.name == 'nt':
     pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
 
-# ── Funciones de extracción ───────────────────────────────────────────────────
+# ── Extracción ────────────────────────────────────────────────────────────────
 
 def aislar_texto_azul(imagen_pil, franja=0.07):
     w, h = imagen_pil.size
@@ -29,13 +28,20 @@ def aislar_texto_azul(imagen_pil, franja=0.07):
     img = Image.fromarray(resultado.astype(np.uint8))
     return img.resize((img.width * 4, img.height * 4), Image.LANCZOS)
 
-def extraer_texto(imagen_pil):
-    img_proc = aislar_texto_azul(imagen_pil)
-    return pytesseract.image_to_string(img_proc, lang='eng', config='--psm 6 --oem 3')
+def extraer_texto_multi(imagen_pil):
+    """Prueba varias franjas y devuelve el texto con más información."""
+    mejores = ""
+    for franja in [0.05, 0.07, 0.08, 0.10]:
+        img_proc = aislar_texto_azul(imagen_pil, franja)
+        texto = pytesseract.image_to_string(img_proc, lang='eng', config='--psm 6 --oem 3')
+        if len(texto.strip()) > len(mejores.strip()):
+            mejores = texto
+    return mejores
 
 def parsear_coordenadas(texto):
     tu = texto.upper()
-    # Formato limpio: 14.062602S 69.203552W
+
+    # Caso 1: formato limpio  →  14.062602S 69.203552W
     m = re.search(r'(\d{1,3})[:\.](\d{6})\s*([NS])\s*(\d{1,3})[:\.](\d{6})\s*([WEO])', tu)
     if m:
         lat = float(f"{m.group(1)}.{m.group(2)}")
@@ -43,14 +49,23 @@ def parsear_coordenadas(texto):
         if m.group(3) == 'S': lat = -lat
         if m.group(6) in ('W','O'): lon = -lon
         return lat, lon
-    # Formato fusionado OCR: 14:0626028369:203552W
-    nums = re.findall(r'\d+', tu)
-    hem = re.search(r'([WEO])\s*$', tu.strip())
-    if len(nums) >= 3 and hem and len(nums[1]) >= 8:
-        lat = -float(f"{nums[0]}.{nums[1][:6]}")
-        lon =  float(f"{nums[1][-2:]}.{nums[2][:6]}")
-        if hem.group(1) in ('W','O'): lon = -lon
+
+    # Caso 2: separador no-dígito entre bloques  →  14:0626028'69.203552W
+    m = re.search(r'(\d{1,3})[:\.](\d{6})[^0-9]{1,4}(\d{2})[:\.](\d{6})\s*([WEO])', tu)
+    if m:
+        lat = -float(f"{m.group(1)}.{m.group(2)}")
+        lon =  float(f"{m.group(3)}.{m.group(4)}")
+        if m.group(5) in ('W','O'): lon = -lon
         return lat, lon
+
+    # Caso 3: todo fusionado  →  14:0626028369:203552W
+    m = re.search(r'(\d{1,3})[:\.](\d{6}).{0,4}?(\d{2})[:\.](\d{6})\s*([WEO])', tu)
+    if m:
+        lat = -float(f"{m.group(1)}.{m.group(2)}")
+        lon =  float(f"{m.group(3)}.{m.group(4)}")
+        if m.group(5) in ('W','O'): lon = -lon
+        return lat, lon
+
     return None, None
 
 def parsear_fecha_hora(texto):
@@ -67,7 +82,6 @@ def generar_excel(datos):
     wb = Workbook()
     ws = wb.active
     ws.title = "Coordenadas GPS"
-
     f_titulo = Font(name='Arial', bold=True, color='FFFFFF', size=11)
     f_normal = Font(name='Arial', size=10)
     fill_azul = PatternFill('solid', start_color='2E75B6')
@@ -76,14 +90,12 @@ def generar_excel(datos):
     izq    = Alignment(horizontal='left',   vertical='center')
     borde  = Border(left=Side(style='thin'), right=Side(style='thin'),
                     top=Side(style='thin'),  bottom=Side(style='thin'))
-
     encabezados = ['#', 'Archivo', 'Fecha', 'Hora', 'Latitud', 'Longitud', 'Estado']
     for col, enc in enumerate(encabezados, 1):
         c = ws.cell(row=1, column=col, value=enc)
         c.font = f_titulo; c.fill = fill_azul
         c.alignment = centro; c.border = borde
     ws.row_dimensions[1].height = 22
-
     for i, (archivo, fecha, hora, lat, lon, estado) in enumerate(datos, 1):
         fila = i + 1
         for col, val in enumerate([i, archivo, fecha, hora, lat, lon, estado], 1):
@@ -94,116 +106,120 @@ def generar_excel(datos):
             if i % 2 == 0: c.fill = fill_alt
         ws.cell(row=fila, column=5).number_format = '0.000000'
         ws.cell(row=fila, column=6).number_format = '0.000000'
-
     for col, ancho in zip('ABCDEFG', [5, 38, 18, 16, 14, 14, 16]):
         ws.column_dimensions[col].width = ancho
     ws.freeze_panes = 'A2'
-
     buf = io.BytesIO()
     wb.save(buf)
     buf.seek(0)
     return buf
 
-# ── UI Streamlit ──────────────────────────────────────────────────────────────
+# ── UI ────────────────────────────────────────────────────────────────────────
 
-st.set_page_config(
-    page_title="Extractor GPS",
-    page_icon="📍",
-    layout="wide"
+st.set_page_config(page_title="Extractor GPS Garmin", page_icon="📍", layout="wide")
+
+st.markdown("""
+<style>
+.main-title { font-size:2.2rem; font-weight:700; color:#1a3a5c; }
+.subtitle   { color:#666; font-size:1rem; margin-bottom:1.5rem; }
+.stat-box   { background:#f0f4ff; border-radius:10px; padding:1rem; text-align:center; }
+.stat-num   { font-size:2rem; font-weight:700; color:#2E75B6; }
+.stat-lbl   { color:#666; font-size:0.85rem; }
+</style>
+""", unsafe_allow_html=True)
+
+st.markdown('<p class="main-title">📍 Extractor de Coordenadas GPS</p>', unsafe_allow_html=True)
+st.markdown('<p class="subtitle">Sube tus fotos con marca de agua Garmin · Obtén las coordenadas en Excel al instante</p>', unsafe_allow_html=True)
+st.divider()
+
+with st.sidebar:
+    st.markdown("### ℹ️ Cómo usar")
+    st.markdown("1. 📤 Sube una o varias fotos\n2. 🔍 Clic en **Extraer**\n3. 📊 Revisa la tabla\n4. 📥 Descarga el **Excel**")
+    st.divider()
+    st.markdown("### 📋 Formato soportado")
+    st.code("14.062602S 69.203552W")
+    st.caption("Garmin GPSmap y similares")
+    st.divider()
+    st.caption("v1.1 · Extractor GPS Garmin")
+
+archivos = st.file_uploader(
+    "📤 Arrastra tus fotos aquí o haz clic para seleccionar",
+    type=["jpg","jpeg","png"],
+    accept_multiple_files=True
 )
 
-st.title("📍 Extractor de Coordenadas GPS")
-st.caption("Sube tus fotos con marca de agua Garmin y descarga las coordenadas en Excel")
+if not archivos:
+    st.info("👆 Sube tus fotos para comenzar.")
+    st.stop()
 
 st.divider()
 
-archivos = st.file_uploader(
-    "Arrastra o selecciona tus fotos",
-    type=["jpg", "jpeg", "png"],
-    accept_multiple_files=True,
-    help="Puedes subir varias fotos a la vez"
-)
+# Vista previa
+with st.expander(f"🖼️ Vista previa — {len(archivos)} foto(s)", expanded=False):
+    cols = st.columns(min(len(archivos), 4))
+    for i, f in enumerate(archivos):
+        with cols[i % 4]:
+            f.seek(0)
+            st.image(Image.open(f), caption=f.name, use_container_width=True)
 
-if archivos:
+st.divider()
+
+if st.button("🔍 Extraer coordenadas", type="primary", use_container_width=True):
+    datos = []
+    ok_count = 0
+
+    progress  = st.progress(0, text="Iniciando...")
+    status    = st.empty()
+
+    # Encabezados
+    h = st.columns([0.4, 2.2, 1.4, 1.4, 1.4, 1.4, 0.5])
+    for col, lbl in zip(h, ['#','Archivo','Fecha','Hora','Latitud','Longitud','✓']):
+        col.markdown(f"**{lbl}**")
+    st.markdown("---")
+
+    for idx, archivo in enumerate(archivos):
+        status.info(f"⏳ Procesando **{archivo.name}** ({idx+1}/{len(archivos)})")
+        try:
+            archivo.seek(0)
+            img          = Image.open(archivo)
+            texto        = extraer_texto_multi(img)
+            lat, lon     = parsear_coordenadas(texto)
+            fecha, hora  = parsear_fecha_hora(texto)
+            if lat is not None:
+                ok_count += 1
+                icono = "✅"
+            else:
+                icono = "⚠️"
+            row = st.columns([0.4, 2.2, 1.4, 1.4, 1.4, 1.4, 0.5])
+            row[0].write(idx + 1)
+            row[1].write(archivo.name)
+            row[2].write(fecha or "—")
+            row[3].write(hora  or "—")
+            row[4].write(f"{lat:.6f}" if lat is not None else "—")
+            row[5].write(f"{lon:.6f}" if lon is not None else "—")
+            row[6].write(icono)
+            datos.append((archivo.name, fecha, hora, lat, lon,
+                          "OK" if lat is not None else "Sin coordenadas"))
+        except Exception as e:
+            row = st.columns([0.4, 2.2, 1.4, 1.4, 1.4, 1.4, 0.5])
+            row[0].write(idx + 1); row[1].write(archivo.name); row[6].write("❌")
+            datos.append((archivo.name, None, None, None, None, f"Error: {e}"))
+
+        progress.progress((idx+1)/len(archivos), text=f"Procesando {idx+1}/{len(archivos)}...")
+
+    status.empty(); progress.empty()
     st.divider()
-    st.subheader(f"📷 {len(archivos)} foto(s) cargada(s)")
 
-    if st.button("🔍 Extraer coordenadas", type="primary", use_container_width=True):
-        datos = []
-        resultados_ui = []
-
-        progress = st.progress(0, text="Procesando fotos...")
-        cols_header = st.columns([2, 1.5, 1.5, 1.5, 1.5, 1])
-        cols_header[0].markdown("**Archivo**")
-        cols_header[1].markdown("**Fecha**")
-        cols_header[2].markdown("**Hora**")
-        cols_header[3].markdown("**Latitud**")
-        cols_header[4].markdown("**Longitud**")
-        cols_header[5].markdown("**Estado**")
-        st.divider()
-
-        for idx, archivo in enumerate(archivos):
-            try:
-                img = Image.open(archivo)
-                texto = extraer_texto(img)
-                lat, lon = parsear_coordenadas(texto)
-                fecha, hora = parsear_fecha_hora(texto)
-                estado = "✅" if lat is not None else "⚠️"
-
-                cols = st.columns([2, 1.5, 1.5, 1.5, 1.5, 1])
-                cols[0].write(archivo.name)
-                cols[1].write(fecha or "—")
-                cols[2].write(hora or "—")
-                cols[3].write(f"{lat:.6f}" if lat else "—")
-                cols[4].write(f"{lon:.6f}" if lon else "—")
-                cols[5].write(estado)
-
-                datos.append((archivo.name, fecha, hora, lat, lon,
-                               "OK" if lat else "Sin coordenadas"))
-
-            except Exception as e:
-                cols = st.columns([2, 1.5, 1.5, 1.5, 1.5, 1])
-                cols[0].write(archivo.name)
-                cols[5].write("❌")
-                datos.append((archivo.name, None, None, None, None, f"Error: {e}"))
-
-            progress.progress((idx + 1) / len(archivos),
-                              text=f"Procesando {idx+1}/{len(archivos)}...")
-
-        progress.empty()
-        st.divider()
-
-        ok = sum(1 for d in datos if d[4] is not None)
-        if ok > 0:
-            st.success(f"✅ {ok} de {len(archivos)} fotos con coordenadas extraídas")
-            excel_buf = generar_excel(datos)
-            st.download_button(
-                label="📥 Descargar Excel",
-                data=excel_buf,
-                file_name="coordenadas.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                type="primary",
-                use_container_width=True
-            )
-        else:
-            st.warning("⚠️ No se pudieron extraer coordenadas de ninguna foto.")
-
-else:
-    st.info("👆 Sube tus fotos para comenzar")
-
-with st.sidebar:
-    st.markdown("### ℹ️ Instrucciones")
-    st.markdown("""
-    1. Sube una o varias fotos
-    2. Haz clic en **Extraer coordenadas**
-    3. Revisa los resultados
-    4. Descarga el **Excel**
-
-    ---
-    **Formato soportado:**
-    Marca de agua azul con coordenadas decimales
-    `14.062602S 69.203552W`
-
-    **Dispositivos compatibles:**
-    Garmin GPSmap y similares
-    """)
+    if ok_count > 0:
+        fail = len(archivos) - ok_count
+        st.success(f"✅ {ok_count} foto(s) con coordenadas · {fail} sin detectar")
+        st.download_button(
+            label="📥 Descargar Excel",
+            data=generar_excel(datos),
+            file_name="coordenadas_gps.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            type="primary",
+            use_container_width=True
+        )
+    else:
+        st.error("❌ No se detectaron coordenadas. Verifica que las fotos tengan la marca de agua azul.")

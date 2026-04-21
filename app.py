@@ -91,28 +91,90 @@ def parsear_lon(s):
         return -v if m.group(2) in ('W','O') else v
     return None
 
+def convertir_utm(data):
+    """Convierte coordenadas UTM a decimales."""
+    try:
+        import utm as utm_lib
+        for val in data.values():
+            if val:
+                m = re.search(r'(\d{1,2})([A-Z])\s+(\d{6,7})\s+(\d{7})', str(val).upper())
+                if m:
+                    lat, lon = utm_lib.to_latlon(
+                        int(m.group(3)), int(m.group(4)),
+                        int(m.group(1)), m.group(2)
+                    )
+                    return round(lat, 6), round(lon, 6)
+    except Exception:
+        pass
+    return None, None
+
+def llamar_gpt_multiformat(img_pil, api_key, modelo="gpt-4o-mini"):
+    """Detecta coordenadas decimales y UTM."""
+    img_recortada = recortar_marca_agua(img_pil)
+    payload = {
+        "model": modelo,
+        "max_tokens": 200,
+        "temperature": 0,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:image/jpeg;base64,{imagen_a_base64(img_recortada)}",
+                        "detail": "high"
+                    }
+                },
+                {
+                    "type": "text",
+                    "text": (
+                        "Lee el texto de la marca de agua GPS visible en esta imagen.\n"
+                        "Responde SOLO con JSON (sin markdown).\n\n"
+                        "Si las coordenadas son DECIMALES (ej: 14.062602S 69.203552W):\n"
+                        '{"tipo":"decimal","fecha":"8 abr 2026","hora":"10:26:27 a.m.",'
+                        '"latitud":"14.005450S","longitud":"69.252968W","utm":null}\n\n'
+                        "Si las coordenadas son UTM (ej: 19L 248384 8454372):\n"
+                        '{"tipo":"utm","fecha":"18 abr 2026","hora":"8:47:30 a. m.",'
+                        '"latitud":null,"longitud":null,"utm":"19L 248384 8454372"}\n\n'
+                        "Extrae los valores EXACTOS. Si no puedes leer alguno usa null."
+                    )
+                }
+            ]
+        }]
+    }
+    resp = requests.post(
+        "https://api.openai.com/v1/chat/completions",
+        headers={"Content-Type": "application/json",
+                 "Authorization": f"Bearer {api_key}"},
+        json=payload, timeout=30
+    )
+    if resp.status_code != 200:
+        return None
+    texto = resp.json()["choices"][0]["message"]["content"].strip()
+    texto = re.sub(r"```json|```", "", texto).strip()
+    return json.loads(texto)
+
 
 def extraer_coordenadas(img_pil, api_key):
-    """
-    Intento 1: gpt-4o-mini con recorte de marca de agua
-    Intento 2: gpt-4o si no detecta lat (casos difíciles)
-    """
-    data = llamar_gpt(img_pil, api_key, modelo="gpt-4o-mini")
-    lat   = parsear_lat(data.get("latitud") if data else None)
-    lon   = parsear_lon(data.get("longitud") if data else None)
-    fecha = data.get("fecha") if data else None
-    hora  = data.get("hora")  if data else None
-
-    # Reintento con gpt-4o si falta lat o lon
-    if lat is None or lon is None:
-        data2 = llamar_gpt(img_pil, api_key, modelo="gpt-4o")
-        if data2:
-            lat   = parsear_lat(data2.get("latitud"))  or lat
-            lon   = parsear_lon(data2.get("longitud")) or lon
-            fecha = data2.get("fecha") or fecha
-            hora  = data2.get("hora")  or hora
-
-    return lat, lon, fecha, hora
+    """gpt-4o-mini primero, reintenta con gpt-4o si falla."""
+    for modelo in ["gpt-4o-mini", "gpt-4o"]:
+        data = llamar_gpt_multiformat(img_pil, api_key, modelo=modelo)
+        if not data:
+            continue
+        fecha = data.get("fecha")
+        hora  = data.get("hora")
+        if data.get("tipo") == "utm":
+            lat, lon = convertir_utm(data)
+        else:
+            lat = parsear_lat(data.get("latitud"))
+            lon = parsear_lon(data.get("longitud"))
+            if lat is None or lon is None:
+                lat2, lon2 = convertir_utm(data)
+                if lat is None: lat = lat2
+                if lon is None: lon = lon2
+        if lat is not None and lon is not None:
+            return lat, lon, fecha, hora
+    return None, None, None, None
 
 
 # ── Excel ─────────────────────────────────────────────────────────────────────
